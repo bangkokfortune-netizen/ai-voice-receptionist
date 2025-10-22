@@ -13,7 +13,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || 'You are a helpful AI assistant.';
 
 // Twilio Voice Webhook - Returns TwiML to connect to Media Stream
-fastify.get('/voice-webhook', async (request, reply) => {
+fastify.post('/voice-webhook', async (request, reply) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
     <Response>
       <Connect>
@@ -156,3 +156,4 @@ const start = async () => {
 };
 
 start();
+
