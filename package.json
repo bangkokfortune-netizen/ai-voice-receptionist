@@ -1,6 +1,7 @@
 {
   "name": "ai-voice-receptionist",
   "version": "1.0.0",
+    "type": "module",
   "description": "Real-time AI Voice Receptionist with Twilio + OpenAI Realtime API",
   "main": "index.js",
   "scripts": {
@@ -18,3 +19,4 @@
     "node": ">=18.0.0"
   }
 }
+
