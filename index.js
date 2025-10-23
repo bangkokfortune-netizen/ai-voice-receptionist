@@ -99,7 +99,8 @@ wss.on('connection', async (twilioWs, req) => {
         }
         
         if (event.type === 'input_audio_buffer.speech_stopped') {
-    console.log('User stopped speaking - Server VAD will handle');        
+    console.log('User stopped speaking - Server VAD will handle')
+          };        
         if (event.type === 'error') {
           console.error('OpenAI error:', event.error);
         }
@@ -231,4 +232,5 @@ function resample16to8(pcm16k) {
 }
 
 server.listen(PORT, () => console.log(`Server on port ${PORT}`));
+
 
