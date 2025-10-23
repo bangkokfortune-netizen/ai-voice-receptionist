@@ -1,4 +1,4 @@
-// index.js - Complete OpenAI Realtime API with Audio Resampling
+// index.js - Complete OpenAI Realtime API with Audio Resampling Pipeline
 import http from 'http';
 import express from 'express';
 import { WebSocketServer } from 'ws';
@@ -8,14 +8,116 @@ import OpenAI from 'openai';
 const app = express();
 const PORT = process.env.PORT || 5050;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || 'You are FortuneOne AI Receptionist.';
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "You are FortuneOne AI Receptionist.";
+const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
+const TONE_TEST = process.env.TONE_TEST === 'true';
+const ECHO_TEST = process.env.ECHO_TEST === 'true';
 
 if (!OPENAI_API_KEY) {
   console.error('ERROR: OPENAI_API_KEY required');
   process.exit(1);
 }
 
-app.get('/healthz', (_, res) => res.status(200).send('ok'));
+// ========== μ-law encode/decode ==========
+const MULAW_TABLE = (() => {
+  const table = new Uint8Array(65536);
+  for (let i = 0; i < 65536; i++) {
+    const pcm = (i - 32768);
+    const sign = pcm < 0 ? 0x80 : 0;
+    const absVal = Math.abs(pcm);
+    const adjusted = 33 + Math.log(1 + 255 * (absVal / 32768)) / Math.log(256) * 255;
+    table[i] = sign | (Math.min(127, Math.floor(adjusted)) ^ 0x55);
+  }
+  return table;
+})();
+
+function linear2ulaw(pcm16Sample) {
+  return MULAW_TABLE[(pcm16Sample + 32768) & 0xFFFF];
+}
+
+function ulaw2linear(ulawByte) {
+  ulawByte = ~ulawByte;
+  const sign = (ulawByte & 0x80) ? -1 : 1;
+  const exponent = (ulawByte & 0x70) >> 4;
+  const mantissa = ulawByte & 0x0F;
+  let magnitude = ((mantissa << 3) + 0x84) << exponent;
+  magnitude = magnitude - 0x84;
+  return sign * magnitude;
+}
+
+function ulawB64ToPCM8k(ulawB64) {
+  const ulawBuf = Buffer.from(ulawB64, 'base64');
+  const pcmBuf = Buffer.alloc(ulawBuf.length * 2);
+  for (let i = 0; i < ulawBuf.length; i++) {
+    const linear = ulaw2linear(ulawBuf[i]);
+    pcmBuf.writeInt16LE(linear, i * 2);
+  }
+  return pcmBuf;
+}
+
+function pcm8kToUlawB64(pcmBuf) {
+  const ulawBuf = Buffer.alloc(pcmBuf.length / 2);
+  for (let i = 0; i < ulawBuf.length; i++) {
+    const sample = pcmBuf.readInt16LE(i * 2);
+    ulawBuf[i] = linear2ulaw(sample);
+  }
+  return ulawBuf.toString('base64');
+}
+
+// ========== Resample 8k <-> 16k ==========
+function up8to16(pcm8k) {
+  const samples8k = pcm8k.length / 2;
+  const pcm16k = Buffer.alloc(samples8k * 4);
+  for (let i = 0; i < samples8k; i++) {
+    const sample = pcm8k.readInt16LE(i * 2);
+    pcm16k.writeInt16LE(sample, i * 4);
+    pcm16k.writeInt16LE(sample, i * 4 + 2);
+  }
+  return pcm16k;
+}
+
+function down16to8(pcm16k) {
+  const samples16k = pcm16k.length / 2;
+  const pcm8k = Buffer.alloc(samples16k);
+  for (let i = 0; i < samples16k / 2; i++) {
+    const s1 = pcm16k.readInt16LE(i * 4);
+    const s2 = pcm16k.readInt16LE(i * 4 + 2);
+    const avg = Math.floor((s1 + s2) / 2);
+    pcm8k.writeInt16LE(avg, i * 2);
+  }
+  return pcm8k;
+}
+
+// ========== Split into 20ms frames @ 8kHz ==========
+function splitFrames20msPCM8k(pcmBuf) {
+  const FRAME_SIZE = 160 * 2; // 160 samples * 2 bytes = 320 bytes
+  const frames = [];
+  for (let offset = 0; offset < pcmBuf.length; offset += FRAME_SIZE) {
+    const chunk = pcmBuf.slice(offset, offset + FRAME_SIZE);
+    if (chunk.length === FRAME_SIZE) {
+      frames.push(chunk);
+    }
+  }
+  return frames;
+}
+
+// ========== Tone Test Function ==========
+function generateTone440Hz(durationMs) {
+  const SAMPLE_RATE = 8000;
+  const numSamples = Math.floor((SAMPLE_RATE * durationMs) / 1000);
+  const buf = Buffer.alloc(numSamples);
+  for (let i = 0; i < numSamples; i++) {
+    const t = i / SAMPLE_RATE;
+    const amplitude = 0.5;
+    const pcm16 = Math.floor(amplitude * 32767 * Math.sin(2 * Math.PI * 440 * t));
+    buf[i] = linear2ulaw(pcm16);
+  }
+  return buf;
+}
+
+// ========== HTTP Server + WebSocket Upgrade ==========
+app.get('/health', (_, res) => res.status(200).send('OK'));
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
@@ -29,15 +131,18 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
+// ========== Main Connection Handler ==========
 wss.on('connection', async (twilioWs, req) => {
   console.log('WS connected:', req.url);
   
   let openaiWs = null;
   let streamSid = null;
   let audioBuffer = [];
+  let debounceTimer = null;
 
+  // Connect to OpenAI Realtime
   try {
-    openaiWs = new WS('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
+    openaiWs = new WS('wss://api.openai.com/v1/realtime?model=' + OPENAI_REALTIME_MODEL, {
       headers: {
         'Authorization': `Bearer ${OPENAI_API_KEY}`,
         'OpenAI-Beta': 'realtime=v1'
@@ -46,191 +151,148 @@ wss.on('connection', async (twilioWs, req) => {
 
     openaiWs.on('open', () => {
       console.log('OpenAI connected');
+      
+      // session.update
       openaiWs.send(JSON.stringify({
         type: 'session.update',
         session: {
           modalities: ['text', 'audio'],
-          instructions: SYSTEM_PROMPT,
           voice: 'alloy',
+          turn_detection: { type: 'none' },
           input_audio_format: 'pcm16',
           output_audio_format: 'pcm16',
-          input_audio_transcription: { model: 'whisper-1' },
-          turn_detection: {
-            type: 'server_vad',
-            threshold: 0.5,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 500
-          }
+          instructions: SYSTEM_PROMPT
+        }
+      }));
+      
+      // Initial greeting
+      openaiWs.send(JSON.stringify({
+        type: 'response.create',
+        response: {
+          modalities: ['audio'],
+          instructions: 'Greet the caller briefly and professionally.'
         }
       }));
     });
 
     openaiWs.on('message', (data) => {
-      try {
-        const event = JSON.parse(data.toString());
-        
-        if (event.type === 'session.updated') {
-          console.log('Session updated - sending greeting');
-          openaiWs.send(JSON.stringify({
-            type: 'response.create',
-            response: {
-              modalities: ['audio', 'text'],
-              instructions: 'Greet warmly in English: Hello! How can I help you today?'
-            }
-          }));
-        }
-        
-        if (event.type === 'response.audio.delta' && event.delta) {
-          const pcm16 = Buffer.from(event.delta, 'base64');
-          const pcm8k = resample16to8(pcm16);
-          const mulaw = pcm16ToMulaw(pcm8k);
+      const msg = JSON.parse(data.toString());
+      
+      // Handle both delta event types
+      if (msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') {
+        const deltaB64 = msg.delta;
+        if (deltaB64 && streamSid) {
+          console.log('delta len:', Buffer.from(deltaB64, 'base64').length);
           
-          if (streamSid && twilioWs.readyState === WS.OPEN) {
+          // PCM16 16k -> PCM16 8k -> split -> μ-law -> Twilio
+          const pcm16k = Buffer.from(deltaB64, 'base64');
+          const pcm8k = down16to8(pcm16k);
+          const frames = splitFrames20msPCM8k(pcm8k);
+          
+          frames.forEach(frame => {
+            const ulawB64 = pcm8kToUlawB64(frame);
             twilioWs.send(JSON.stringify({
               event: 'media',
               streamSid: streamSid,
-              media: { payload: mulaw.toString('base64') }
+              media: { payload: ulawB64 }
             }));
-          }
+          });
+          
+          console.log('frames out:', frames.length);
         }
-        
-        if (event.type === 'input_audio_buffer.speech_started') {
-          console.log('User speaking');
-        }
-        
-        if (event.type === 'input_audio_buffer.speech_stopped') {
-    console.log('User stopped speaking - Server VAD will handle')
-          };        
-        if (event.type === 'error') {
-          console.error('OpenAI error:', event.error);
-        }
-      } catch (err) {
-        console.error('Parse error:', err);
+      }
+      
+      if (msg.type === 'error') {
+        console.error('OpenAI error:', msg.error);
       }
     });
 
-    openaiWs.on('error', (err) => console.error('OpenAI WS error:', err));
-    openaiWs.on('close', () => console.log('OpenAI closed'));
+    openaiWs.on('error', (err) => {
+      console.error('OpenAI WS error:', err);
+    });
+
+    openaiWs.on('close', () => {
+      console.log('OpenAI disconnected');
+    });
 
   } catch (err) {
-    console.error('Failed OpenAI connect:', err);
+    console.error('Failed to connect to OpenAI:', err);
   }
 
-  twilioWs.on('message', async (buf) => {
-    try {
-      const msg = JSON.parse(buf.toString());
+  // Twilio events
+  twilioWs.on('message', (data) => {
+    const msg = JSON.parse(data.toString());
+    
+    if (msg.event === 'start') {
+      streamSid = msg.start.streamSid;
+      console.log('stream start', streamSid);
       
-      if (msg.event === 'start') {
-        streamSid = msg.start.streamSid;
-        console.log('stream start', streamSid);
-      }
-      
-      if (msg.event === 'media' && openaiWs && openaiWs.readyState === WS.OPEN) {
-        const mulaw = Buffer.from(msg.media.payload, 'base64');
-        const pcm8k = mulawToPcm16(mulaw);
-        const pcm16k = resample8to16(pcm8k);
-        
-        openaiWs.send(JSON.stringify({
-          type: 'input_audio_buffer.append',
-          audio: pcm16k.toString('base64')
-        }));
-      }
-      
-      if (msg.event === 'stop') {
-        console.log('stream stop');
-        if (openaiWs && openaiWs.readyState === WS.OPEN) {
-          openaiWs.close();
+      // Tone test if enabled
+      if (TONE_TEST) {
+        console.log('TONE_TEST enabled - sending 1s tone');
+        const toneBuf = generateTone440Hz(1000);
+        const frames = [];
+        for (let i = 0; i < toneBuf.length; i += 160) {
+          frames.push(toneBuf.slice(i, i + 160));
         }
+        frames.forEach(frame => {
+          if (frame.length === 160) {
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid: streamSid,
+              media: { payload: frame.toString('base64') }
+            }));
+          }
+        });
       }
-    } catch (e) {
-      console.error('parse error:', e);
+    }
+    
+    if (msg.event === 'media' && openaiWs && openaiWs.readyState === WS.OPEN) {
+      const ulawB64 = msg.media.payload;
+      
+      // Echo test if enabled
+      if (ECHO_TEST) {
+        twilioWs.send(JSON.stringify({
+          event: 'media',
+          streamSid: streamSid,
+          media: { payload: ulawB64 }
+        }));
+        return;
+      }
+      
+      // μ-law 8k -> PCM16 8k -> PCM16 16k
+      const pcm8k = ulawB64ToPCM8k(ulawB64);
+      const pcm16k = up8to16(pcm8k);
+      const pcm16kB64 = pcm16k.toString('base64');
+      
+      // Append to buffer
+      openaiWs.send(JSON.stringify({
+        type: 'input_audio_buffer.append',
+        audio: pcm16kB64
+      }));
+      
+      console.log('append', pcm16k.length, 'bytes');
+      
+      // Debounce commit + response.create
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+        openaiWs.send(JSON.stringify({ type: 'response.create' }));
+        console.log('commit + response.create');
+      }, 400);
     }
   });
 
   twilioWs.on('close', () => {
-    console.log('Twilio closed');
-    if (openaiWs && openaiWs.readyState === WS.OPEN) {
-      openaiWs.close();
-    }
+    console.log('Twilio disconnected');
+    if (openaiWs) openaiWs.close();
+    if (debounceTimer) clearTimeout(debounceTimer);
   });
-
-  const ka = setInterval(() => {
-    if (twilioWs.readyState === WS.OPEN) twilioWs.ping();
-  }, 15000);
-  
-  twilioWs.on('close', () => clearInterval(ka));
 });
 
-// Audio conversion functions
-function mulawToPcm16(mulawData) {
-  const table = [
-    -32124,-31100,-30076,-29052,-28028,-27004,-25980,-24956,-23932,-22908,-21884,-20860,-19836,-18812,-17788,-16764,
-    -15996,-15484,-14972,-14460,-13948,-13436,-12924,-12412,-11900,-11388,-10876,-10364,-9852,-9340,-8828,-8316,
-    -7932,-7676,-7420,-7164,-6908,-6652,-6396,-6140,-5884,-5628,-5372,-5116,-4860,-4604,-4348,-4092,
-    -3900,-3772,-3644,-3516,-3388,-3260,-3132,-3004,-2876,-2748,-2620,-2492,-2364,-2236,-2108,-1980,
-    -1884,-1820,-1756,-1692,-1628,-1564,-1500,-1436,-1372,-1308,-1244,-1180,-1116,-1052,-988,-924,
-    -876,-844,-812,-780,-748,-716,-684,-652,-620,-588,-556,-524,-492,-460,-428,-396,
-    -372,-356,-340,-324,-308,-292,-276,-260,-244,-228,-212,-196,-180,-164,-148,-132,
-    -120,-112,-104,-96,-88,-80,-72,-64,-56,-48,-40,-32,-24,-16,-8,0,
-    32124,31100,30076,29052,28028,27004,25980,24956,23932,22908,21884,20860,19836,18812,17788,16764,
-    15996,15484,14972,14460,13948,13436,12924,12412,11900,11388,10876,10364,9852,9340,8828,8316,
-    7932,7676,7420,7164,6908,6652,6396,6140,5884,5628,5372,5116,4860,4604,4348,4092,
-    3900,3772,3644,3516,3388,3260,3132,3004,2876,2748,2620,2492,2364,2236,2108,1980,
-    1884,1820,1756,1692,1628,1564,1500,1436,1372,1308,1244,1180,1116,1052,988,924,
-    876,844,812,780,748,716,684,652,620,588,556,524,492,460,428,396,
-    372,356,340,324,308,292,276,260,244,228,212,196,180,164,148,132,
-    120,112,104,96,88,80,72,64,56,48,40,32,24,16,8,0
-  ];
-  const pcm = Buffer.alloc(mulawData.length * 2);
-  for (let i = 0; i < mulawData.length; i++) {
-    pcm.writeInt16LE(table[mulawData[i]], i * 2);
-  }
-  return pcm;
-}
-
-function pcm16ToMulaw(pcm16Data) {
-  const mulaw = Buffer.alloc(pcm16Data.length / 2);
-  for (let i = 0; i < mulaw.length; i++) {
-    const sample = pcm16Data.readInt16LE(i * 2);
-    mulaw[i] = linearToMulaw(sample);
-  }
-  return mulaw;
-}
-
-function linearToMulaw(sample) {
-  const MAX = 0x1FFF;
-  const BIAS = 33;
-  let sign = (sample < 0) ? 0x80 : 0;
-  if (sign) sample = -sample;
-  if (sample > MAX) sample = MAX;
-  sample += BIAS;
-  let exp = 7;
-  for (let mask = 0x4000; (sample & mask) === 0 && exp > 0; exp--, mask >>= 1);
-  const mantissa = (sample >> (exp + 3)) & 0x0F;
-  return ~(sign | (exp << 4) | mantissa) & 0xFF;
-}
-
-function resample8to16(pcm8k) {
-  const samples8 = pcm8k.length / 2;
-  const pcm16k = Buffer.alloc(samples8 * 4);
-  for (let i = 0; i < samples8; i++) {
-    const sample = pcm8k.readInt16LE(i * 2);
-    pcm16k.writeInt16LE(sample, i * 4);
-    pcm16k.writeInt16LE(sample, i * 4 + 2);
-  }
-  return pcm16k;
-}
-
-function resample16to8(pcm16k) {
-  const samples16 = pcm16k.length / 2;
-  const pcm8k = Buffer.alloc(Math.floor(samples16 / 2) * 2);
-  for (let i = 0; i < pcm8k.length / 2; i++) {
-    const sample = pcm16k.readInt16LE(i * 4);
-    pcm8k.writeInt16LE(sample, i * 2);
-  }
-  return pcm8k;
-}
-
-server.listen(PORT, () => console.log(`Server on port ${PORT}`));
-
-
+server.listen(PORT, () => {
+  console.log(`Server on port ${PORT}`);
+  console.log('TONE_TEST:', TONE_TEST);
+  console.log('ECHO_TEST:', ECHO_TEST);
+  console.log('OPENAI_REALTIME_MODEL:', OPENAI_REALTIME_MODEL);
+});
