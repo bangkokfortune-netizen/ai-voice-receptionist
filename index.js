@@ -38,6 +38,7 @@ wss.on('connection', async (twilioWs, req) => {
   
   let openaiWs = null;
   let streamSid = null;
+  let sessionInitialized = false;
 
   // Initialize OpenAI Realtime API connection
   try {
@@ -84,8 +85,33 @@ wss.on('connection', async (twilioWs, req) => {
         const event = JSON.parse(data.toString());
         
         // Log important events
-        if (event.type === 'session.created' || event.type === 'session.updated') {
-          console.log(`OpenAI: ${event.type}`);
+        if (event.type === 'session.created') {
+          console.log('OpenAI: session.created');
+        }
+        
+        if (event.type === 'session.updated') {
+          console.log('OpenAI: session.updated');
+          
+          // After session is configured, send initial greeting
+          if (!sessionInitialized) {
+            sessionInitialized = true;
+            console.log('Sending initial greeting request to OpenAI');
+            openaiWs.send(JSON.stringify({
+              type: 'response.create',
+              response: {
+                modalities: ['audio', 'text'],
+                instructions: 'Greet the caller warmly and ask how you can help them today.'
+              }
+            }));
+          }
+        }
+        
+        if (event.type === 'input_audio_buffer.speech_started') {
+          console.log('OpenAI: User started speaking');
+        }
+        
+        if (event.type === 'input_audio_buffer.speech_stopped') {
+          console.log('OpenAI: User stopped speaking');
         }
         
         if (event.type === 'conversation.item.created') {
@@ -109,8 +135,16 @@ wss.on('connection', async (twilioWs, req) => {
           }
         }
         
+        if (event.type === 'response.audio_transcript.delta') {
+          console.log('AI speaking:', event.delta);
+        }
+        
         if (event.type === 'response.audio_transcript.done') {
-          console.log('AI transcript:', event.transcript);
+          console.log('AI transcript complete:', event.transcript);
+        }
+        
+        if (event.type === 'conversation.item.input_audio_transcription.completed') {
+          console.log('User said:', event.transcript);
         }
         
         if (event.type === 'error') {
