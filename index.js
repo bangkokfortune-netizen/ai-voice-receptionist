@@ -1,4 +1,4 @@
-// index.js - Complete OpenAI Realtime API with Audio Resampling Pipeline
+// FortuneOne Voice Gateway — hardened pipeline
 import http from 'http';
 import express from 'express';
 import { WebSocketServer } from 'ws';
@@ -6,7 +6,7 @@ import { WebSocket as WS } from 'ws';
 import OpenAI from 'openai';
 
 const app = express();
-const PORT = process.env.PORT || 5050;
+const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "You are FortuneOne AI Receptionist.";
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
@@ -45,7 +45,7 @@ function ulaw2linear(ulawByte) {
   return sign * magnitude;
 }
 
-function ulawB64ToPCM8k(ulawB64) {
+function ulawBufToPCM16(ulawB64) {
   const ulawBuf = Buffer.from(ulawB64, 'base64');
   const pcmBuf = Buffer.alloc(ulawBuf.length * 2);
   for (let i = 0; i < ulawBuf.length; i++) {
@@ -55,244 +55,206 @@ function ulawB64ToPCM8k(ulawB64) {
   return pcmBuf;
 }
 
-function pcm8kToUlawB64(pcmBuf) {
+function pcm16ToUlawBuf(pcmBuf) {
   const ulawBuf = Buffer.alloc(pcmBuf.length / 2);
   for (let i = 0; i < ulawBuf.length; i++) {
-    const sample = pcmBuf.readInt16LE(i * 2);
-    ulawBuf[i] = linear2ulaw(sample);
+    const pcm = pcmBuf.readInt16LE(i * 2);
+    ulawBuf[i] = linear2ulaw(pcm);
   }
-  return ulawBuf.toString('base64');
+  return ulawBuf;
 }
 
-// ========== Resample 8k <-> 16k ==========
-function up8to16(pcm8k) {
-  const samples8k = pcm8k.length / 2;
-  const pcm16k = Buffer.alloc(samples8k * 4);
-  for (let i = 0; i < samples8k; i++) {
-    const sample = pcm8k.readInt16LE(i * 2);
-    pcm16k.writeInt16LE(sample, i * 4);
-    pcm16k.writeInt16LE(sample, i * 4 + 2);
+// ========== resample 16k PCM → 8k PCM ==========
+function downsample16to8(pcm16k) {
+  const out = Buffer.alloc(pcm16k.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out.writeInt16LE(pcm16k.readInt16LE(i * 4), i * 2);
   }
-  return pcm16k;
+  return out;
 }
 
-function down16to8(pcm16k) {
-  const samples16k = pcm16k.length / 2;
-  const pcm8k = Buffer.alloc(samples16k);
-  for (let i = 0; i < samples16k / 2; i++) {
-    const s1 = pcm16k.readInt16LE(i * 4);
-    const s2 = pcm16k.readInt16LE(i * 4 + 2);
-    const avg = Math.floor((s1 + s2) / 2);
-    pcm8k.writeInt16LE(avg, i * 2);
-  }
-  return pcm8k;
-}
-
-// ========== Split into 20ms frames @ 8kHz ==========
-function splitFrames20msPCM8k(pcmBuf) {
-  const FRAME_SIZE = 160 * 2; // 160 samples * 2 bytes = 320 bytes
+// ========== split PCM into 20ms @ 8kHz (160 samples) ==========
+function splitFrames20ms(pcmBuf) {
   const frames = [];
-  for (let offset = 0; offset < pcmBuf.length; offset += FRAME_SIZE) {
-    const chunk = pcmBuf.slice(offset, offset + FRAME_SIZE);
-    if (chunk.length === FRAME_SIZE) {
-      frames.push(chunk);
-    }
+  const frameSize = 320; // 160 samples * 2 bytes
+  for (let i = 0; i < pcmBuf.length; i += frameSize) {
+    frames.push(pcmBuf.subarray(i, i + frameSize));
   }
   return frames;
 }
 
-// ========== Tone Test Function ==========
-function generateTone440Hz(durationMs) {
-  const SAMPLE_RATE = 8000;
-  const numSamples = Math.floor((SAMPLE_RATE * durationMs) / 1000);
-  const buf = Buffer.alloc(numSamples);
-  for (let i = 0; i < numSamples; i++) {
-    const t = i / SAMPLE_RATE;
-    const amplitude = 0.5;
-    const pcm16 = Math.floor(amplitude * 32767 * Math.sin(2 * Math.PI * 440 * t));
-    buf[i] = linear2ulaw(pcm16);
+// ========== tone generator @ 440Hz ==========
+function generateTone440Hz() {
+  const sampleRate = 8000;
+  const durationSeconds = 1;
+  const samples = sampleRate * durationSeconds;
+  const pcmBuf = Buffer.alloc(samples * 2);
+  for (let i = 0; i < samples; i++) {
+    const t = i / sampleRate;
+    const val = Math.floor(Math.sin(2 * Math.PI * 440 * t) * 16000);
+    pcmBuf.writeInt16LE(val, i * 2);
   }
-  return buf;
+  return pcmBuf;
 }
 
-// ========== HTTP Server + WebSocket Upgrade ==========
-app.get('/health', (_, res) => res.status(200).send('OK'));
+// ========== Twilio route ==========
+app.get('/healthz', (_, res) => res.status(200).send('OK'));
 
-const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
-
-server.on('upgrade', (req, socket, head) => {
-  if (req.url === '/media-stream') {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req);
-    });
-  } else {
-    socket.destroy();
-  }
+app.post('/incoming', (req, res) => {
+  res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Hello, connecting you now.</Say>
+  <Connect><Stream url="wss://${req.headers.host}/media"/></Connect>
+</Response>`);
 });
 
-// ========== Main Connection Handler ==========
-wss.on('connection', async (twilioWs, req) => {
-  console.log('WS connected:', req.url);
-  
-  let openaiWs = null;
-  let streamSid = null;
-  let audioBuffer = [];
-  let debounceTimer = null;
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/media' });
 
-  // Connect to OpenAI Realtime
-  try {
-    openaiWs = new WS('wss://api.openai.com/v1/realtime?model=' + OPENAI_REALTIME_MODEL, {
-      headers: {
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1'
+wss.on('connection', (twilioWs) => {
+  console.log('Twilio connected');
+  let streamSid = null;
+  let openai = null;
+
+  // TONE_TEST mode
+  if (TONE_TEST) {
+    console.log('TONE_TEST enabled');
+    twilioWs.on('message', (data) => {
+      const msg = JSON.parse(data);
+      if (msg.event === 'start') {
+        streamSid = msg.start.streamSid;
+        console.log('stream start:', streamSid);
+        const tonePcm = generateTone440Hz();
+        const toneUlaw = pcm16ToUlawBuf(tonePcm);
+        const frames = splitFrames20ms(Buffer.concat([toneUlaw]));
+        console.log('tone frames out:', frames.length);
+        frames.forEach((f, idx) => {
+          setTimeout(() => {
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid,
+              media: { payload: f.toString('base64') }
+            }));
+          }, idx * 20);
+        });
       }
     });
+    return;
+  }
 
-    openaiWs.on('open', () => {
-      console.log('OpenAI connected');
-      
-      // session.update
-      openaiWs.send(JSON.stringify({
+  // ECHO_TEST mode
+  if (ECHO_TEST) {
+    console.log('ECHO_TEST enabled');
+    twilioWs.on('message', (data) => {
+      const msg = JSON.parse(data);
+      if (msg.event === 'start') {
+        streamSid = msg.start.streamSid;
+        console.log('stream start:', streamSid);
+      } else if (msg.event === 'media') {
+        twilioWs.send(JSON.stringify({
+          event: 'media',
+          streamSid: msg.streamSid,
+          media: { payload: msg.media.payload }
+        }));
+      }
+    });
+    return;
+  }
+
+  // AI mode
+  console.log('AI mode');
+  openai = new WS('wss://api.openai.com/v1/realtime?model=' + OPENAI_REALTIME_MODEL, {
+    headers: { 'Authorization': 'Bearer ' + OPENAI_API_KEY, 'OpenAI-Beta': 'realtime=v1' }
+  });
+
+  let sessionConfigured = false;
+
+  openai.on('open', () => {
+    console.log('OpenAI connected');
+  });
+
+  openai.on('message', (raw) => {
+    const event = JSON.parse(raw);
+    // console.log('← OpenAI:', event.type);
+
+    if (event.type === 'session.created') {
+      openai.send(JSON.stringify({
         type: 'session.update',
         session: {
           modalities: ['text', 'audio'],
+          instructions: SYSTEM_PROMPT,
           voice: 'alloy',
-          turn_detection: { type: 'none' },
           input_audio_format: 'pcm16',
           output_audio_format: 'pcm16',
-          instructions: SYSTEM_PROMPT
+          input_audio_transcription: { model: 'whisper-1' },
+          turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 500 }
         }
       }));
-      
-      // Initial greeting
-      openaiWs.send(JSON.stringify({
-        type: 'response.create',
-        response: {
-          modalities: ['audio'],
-          instructions: 'Greet the caller briefly and professionally.'
+      sessionConfigured = true;
+      // trigger initial greeting
+      openai.send(JSON.stringify({ type: 'response.create' }));
+      console.log('initial response.create sent');
+    }
+
+    // Accept BOTH delta variants
+    if (event.type === 'response.audio.delta' || event.type === 'response.output_audio.delta') {
+      const delta = event.delta || '';
+      if (!delta) return;
+      const pcm16 = Buffer.from(delta, 'base64');
+      const pcm8 = downsample16to8(pcm16);
+      const ulaw = pcm16ToUlawBuf(pcm8);
+      const frames = splitFrames20ms(ulaw);
+      frames.forEach((f) => {
+        if (streamSid) {
+          twilioWs.send(JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: f.toString('base64') }
+          }));
         }
-      }));
-    });
+      });
+      console.log('frames out:', frames.length);
+    }
 
-    openaiWs.on('message', (data) => {
-      const msg = JSON.parse(data.toString());
-      
-      // Handle both delta event types
-      if (msg.type === 'response.audio.delta' || msg.type === 'response.output_audio.delta') {
-        const deltaB64 = msg.delta;
-        if (deltaB64 && streamSid) {
-          console.log('delta len:', Buffer.from(deltaB64, 'base64').length);
-          
-          // PCM16 16k -> PCM16 8k -> split -> μ-law -> Twilio
-          const pcm16k = Buffer.from(deltaB64, 'base64');
-          const pcm8k = down16to8(pcm16k);
-          const frames = splitFrames20msPCM8k(pcm8k);
-          
-          frames.forEach(frame => {
-            const ulawB64 = pcm8kToUlawB64(frame);
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid: streamSid,
-              media: { payload: ulawB64 }
-            }));
-          });
-          
-          console.log('frames out:', frames.length);
-        }
-      }
-      
-      if (msg.type === 'error') {
-        console.error('OpenAI error:', msg.error);
-      }
-    });
+    if (event.type === 'input_audio_buffer.speech_started') {
+      console.log('speech started');
+    }
+    if (event.type === 'input_audio_buffer.speech_stopped') {
+      console.log('speech stopped');
+    }
+    if (event.type === 'input_audio_buffer.committed') {
+      console.log('commit');
+      openai.send(JSON.stringify({ type: 'response.create' }));
+    }
+  });
 
-    openaiWs.on('error', (err) => {
-      console.error('OpenAI WS error:', err);
-    });
+  openai.on('error', (err) => {
+    console.error('OpenAI error:', err);
+  });
+  openai.on('close', () => {
+    console.log('OpenAI disconnected');
+  });
 
-    openaiWs.on('close', () => {
-      console.log('OpenAI disconnected');
-    });
-
-  } catch (err) {
-    console.error('Failed to connect to OpenAI:', err);
-  }
-
-  // Twilio events
   twilioWs.on('message', (data) => {
-    const msg = JSON.parse(data.toString());
-    
+    const msg = JSON.parse(data);
     if (msg.event === 'start') {
       streamSid = msg.start.streamSid;
-      console.log('stream start', streamSid);
-      
-      // Tone test if enabled
-      if (TONE_TEST) {
-        console.log('TONE_TEST enabled - sending 1s tone');
-        const toneBuf = generateTone440Hz(1000);
-        const frames = [];
-        for (let i = 0; i < toneBuf.length; i += 160) {
-          frames.push(toneBuf.slice(i, i + 160));
-        }
-        frames.forEach(frame => {
-          if (frame.length === 160) {
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid: streamSid,
-              media: { payload: frame.toString('base64') }
-            }));
-          }
-        });
-      }
-    }
-    
-    if (msg.event === 'media' && openaiWs && openaiWs.readyState === WS.OPEN) {
-      const ulawB64 = msg.media.payload;
-      
-      // Echo test if enabled
-      if (ECHO_TEST) {
-        twilioWs.send(JSON.stringify({
-          event: 'media',
-          streamSid: streamSid,
-          media: { payload: ulawB64 }
-        }));
-        return;
-      }
-      
-      // μ-law 8k -> PCM16 8k -> PCM16 16k
-      const pcm8k = ulawB64ToPCM8k(ulawB64);
-      const pcm16k = up8to16(pcm8k);
-      const pcm16kB64 = pcm16k.toString('base64');
-      
-      // Append to buffer
-      openaiWs.send(JSON.stringify({
+      console.log('stream start:', streamSid);
+    } else if (msg.event === 'media' && sessionConfigured) {
+      const pcm16 = ulawBufToPCM16(msg.media.payload);
+      openai.send(JSON.stringify({
         type: 'input_audio_buffer.append',
-        audio: pcm16kB64
+        audio: pcm16.toString('base64')
       }));
-      
-      console.log('append', pcm16k.length, 'bytes');
-      
-      // Debounce commit + response.create
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-        openaiWs.send(JSON.stringify({ type: 'response.create' }));
-        console.log('commit + response.create');
-      }, 400);
     }
   });
 
   twilioWs.on('close', () => {
     console.log('Twilio disconnected');
-    if (openaiWs) openaiWs.close();
-    if (debounceTimer) clearTimeout(debounceTimer);
+    if (openai) openai.close();
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`Server on port ${PORT}`);
-  console.log('TONE_TEST:', TONE_TEST);
-  console.log('ECHO_TEST:', ECHO_TEST);
-  console.log('OPENAI_REALTIME_MODEL:', OPENAI_REALTIME_MODEL);
+  console.log(`Server running on port ${PORT}`);
 });
