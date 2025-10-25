@@ -4,7 +4,6 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { WebSocket as WS } from 'ws';
 import OpenAI from 'openai';
-
 const app = express();
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -12,12 +11,10 @@ const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || "You are FortuneOne AI Recept
 const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
 const TONE_TEST = process.env.TONE_TEST === 'true';
 const ECHO_TEST = process.env.ECHO_TEST === 'true';
-
 if (!OPENAI_API_KEY) {
   console.error('ERROR: OPENAI_API_KEY required');
   process.exit(1);
 }
-
 // ========== μ-law encode/decode ==========
 const MULAW_TABLE = (() => {
   const table = new Uint8Array(65536);
@@ -30,11 +27,9 @@ const MULAW_TABLE = (() => {
   }
   return table;
 })();
-
 function linear2ulaw(pcm16Sample) {
   return MULAW_TABLE[(pcm16Sample + 32768) & 0xFFFF];
 }
-
 function ulaw2linear(ulawByte) {
   ulawByte = ~ulawByte;
   const sign = (ulawByte & 0x80) ? -1 : 1;
@@ -44,7 +39,6 @@ function ulaw2linear(ulawByte) {
   magnitude = magnitude - 0x84;
   return sign * magnitude;
 }
-
 function ulawBufToPCM16(ulawB64) {
   const ulawBuf = Buffer.from(ulawB64, 'base64');
   const pcmBuf = Buffer.alloc(ulawBuf.length * 2);
@@ -54,7 +48,6 @@ function ulawBufToPCM16(ulawB64) {
   }
   return pcmBuf;
 }
-
 function pcm16ToUlawBuf(pcmBuf) {
   const ulawBuf = Buffer.alloc(pcmBuf.length / 2);
   for (let i = 0; i < ulawBuf.length; i++) {
@@ -63,7 +56,6 @@ function pcm16ToUlawBuf(pcmBuf) {
   }
   return ulawBuf;
 }
-
 // ========== resample 16k PCM → 8k PCM ==========
 function downsample16to8(pcm16k) {
   const out = Buffer.alloc(pcm16k.length / 2);
@@ -72,7 +64,6 @@ function downsample16to8(pcm16k) {
   }
   return out;
 }
-
 // ========== split PCM into 20ms @ 8kHz (160 samples) ==========
 function splitFrames20ms(pcmBuf) {
   const frames = [];
@@ -82,7 +73,6 @@ function splitFrames20ms(pcmBuf) {
   }
   return frames;
 }
-
 // ========== tone generator @ 440Hz ==========
 function generateTone440Hz() {
   const sampleRate = 8000;
@@ -96,26 +86,29 @@ function generateTone440Hz() {
   }
   return pcmBuf;
 }
-
-// ========== Twilio route ==========
+// ========== Health & Voice routes ==========
+app.get('/', (_, res) => res.status(200).send('OK'));
+app.get('/health', (_, res) => res.status(200).send('OK'));
 app.get('/healthz', (_, res) => res.status(200).send('OK'));
-
-app.post('/incoming', (req, res) => {
-  res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?>
+app.post('/voice', (req, res) => {
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>Hello, connecting you now.</Say>
-  <Connect><Stream url="wss://${req.headers.host}/media"/></Connect>
+  <Connect>
+    <Stream url="wss://${req.headers.host}/media" />
+  </Connect>
 </Response>`);
 });
-
+app.post('/incoming', (req, res) => {
+  res.status(200).send(`<?xml version="1.0" encoding="UTF-8"?><Response>  <Say>Hello, connecting you now.</Say>  <Connect><Stream url="wss://${req.headers.host}/media" /></Connect></Response>`);
+});
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/media' });
-
 wss.on('connection', (twilioWs) => {
   console.log('Twilio connected');
   let streamSid = null;
   let openai = null;
-
   // TONE_TEST mode
   if (TONE_TEST) {
     console.log('TONE_TEST enabled');
@@ -141,7 +134,6 @@ wss.on('connection', (twilioWs) => {
     });
     return;
   }
-
   // ECHO_TEST mode
   if (ECHO_TEST) {
     console.log('ECHO_TEST enabled');
@@ -160,23 +152,18 @@ wss.on('connection', (twilioWs) => {
     });
     return;
   }
-
   // AI mode
   console.log('AI mode');
   openai = new WS('wss://api.openai.com/v1/realtime?model=' + OPENAI_REALTIME_MODEL, {
     headers: { 'Authorization': 'Bearer ' + OPENAI_API_KEY, 'OpenAI-Beta': 'realtime=v1' }
   });
-
   let sessionConfigured = false;
-
   openai.on('open', () => {
     console.log('OpenAI connected');
   });
-
   openai.on('message', (raw) => {
     const event = JSON.parse(raw);
     // console.log('← OpenAI:', event.type);
-
     if (event.type === 'session.created') {
       openai.send(JSON.stringify({
         type: 'session.update',
@@ -195,7 +182,6 @@ wss.on('connection', (twilioWs) => {
       openai.send(JSON.stringify({ type: 'response.create' }));
       console.log('initial response.create sent');
     }
-
     // Accept BOTH delta variants
     if (event.type === 'response.audio.delta' || event.type === 'response.output_audio.delta') {
       const delta = event.delta || '';
@@ -215,7 +201,6 @@ wss.on('connection', (twilioWs) => {
       });
       console.log('frames out:', frames.length);
     }
-
     if (event.type === 'input_audio_buffer.speech_started') {
       console.log('speech started');
     }
@@ -227,14 +212,12 @@ wss.on('connection', (twilioWs) => {
       openai.send(JSON.stringify({ type: 'response.create' }));
     }
   });
-
   openai.on('error', (err) => {
     console.error('OpenAI error:', err);
   });
   openai.on('close', () => {
     console.log('OpenAI disconnected');
   });
-
   twilioWs.on('message', (data) => {
     const msg = JSON.parse(data);
     if (msg.event === 'start') {
@@ -248,13 +231,11 @@ wss.on('connection', (twilioWs) => {
       }));
     }
   });
-
   twilioWs.on('close', () => {
     console.log('Twilio disconnected');
     if (openai) openai.close();
   });
 });
-
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
